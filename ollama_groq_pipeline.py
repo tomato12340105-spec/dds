@@ -107,39 +107,14 @@ def check_python_syntax(code: str) -> tuple:
     
 import multiprocessing
 
-def safe_run_tests(code: str, timeout: int = 5) -> tuple:
-    def target(queue):
-        try:
-            local_env = {}
-            exec(code, local_env)
-
-            # ===== テスト例 =====
-            # 必要に応じてここに追加
-            if "main" in local_env:
-                local_env["main"]()
-
-            queue.put((True, None))
-
-        except Exception as e:
-            queue.put((False, str(e)))
-
-    queue = multiprocessing.Queue()
-    p = multiprocessing.Process(target=target, args=(queue,))
-    p.start()
-    p.join(timeout)
-
-    if p.is_alive():
-        p.terminate()
-        return False, "タイムアウト（無限ループの可能性）"
-
-    return queue.get()
-
 def run_pytest(timeout: int = 30) -> tuple:
     try:
         result = subprocess.run(
-            ["pytest", "--maxfail=3", "--disable-warnings"],
+            ["pytest", "--cov=.", "--cov-report=term", "--disable-warnings"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout
         )
 
@@ -625,7 +600,10 @@ def ollama_generate_diff(design: str, original_code: str, filename: str):
     current_code = original_code
     iteration_no_change = 0
 
-    while True:
+    MAX_OLLAMA_LOOP = 5
+    iteration = 0
+
+    while iteration < MAX_OLLAMA_LOOP:
         iteration += 1
         print(f"  -> Ollama修正試行 {iteration}回目...")
 
@@ -644,10 +622,10 @@ def ollama_generate_diff(design: str, original_code: str, filename: str):
             messages.append({
                 "role": "user",
                 "content": """直前の修正差分で問題がある箇所だけを修正してください。
-無関係なコードは変更しないでください。
-必ず修正後のコード全体をコードブロックで出力してください。"""
-})
-            continue
+                無関係なコードは変更しないでください。
+                必ず修正後のコード全体をコードブロックで出力してください。"""
+            })          
+            continue 
 
         diff_text = compute_diff(current_code, modified_code, filename)
         line_info = format_line_ranges(changed_ranges)
@@ -684,6 +662,8 @@ def ollama_generate_diff(design: str, original_code: str, filename: str):
         else:
             print("  -> Ollamaの再修正なし、現在の修正で進む")
             return diff_text, modified_code
+    print("❌ 最大試行回数に到達（打ち切り）")
+    return None, None   
 
 # ============================
 # ステップ2: Groq(8B)がdiffをチェック → 指摘をdiffで出力
@@ -869,7 +849,10 @@ def main():
 
         test_code = groq_generate_pytest(current_code)
 
-        if is_test_weak(test_code):
+        for _ in range(2):
+            if not is_test_weak(test_code):
+                break
+
             weakness = explain_test_weakness(test_code)
 
             print(f"⚠️ テストが弱い → 再生成\n{weakness}")
@@ -879,7 +862,7 @@ def main():
                 + "\n\n# 以下の不足を必ず改善してください:\n"
                 + weakness
                 + "\n# 異常系・境界値・正常系を含めてください。"
-           )
+            )
 
         with open("test_auto.py", "w", encoding="utf-8") as f:
             f.write(test_code)
@@ -926,10 +909,20 @@ def main():
                 else:
                     ai_8b_calls += 1
                     is_ok, check_result = groq_check_diff(diff_text)
+                    if not is_ok:
+                        print("\n❌ 8BチェックNG → Ollamaへ戻す")
+
+                        task_design = (
+                            f"{task_design}\n\n"
+                            f"[8B指摘]\n{check_result}\n\n"
+                            f"上記の指摘に関係する箇所だけを修正してください。\n"
+                            f"無関係なコードは変更しないでください。"
+                        )
+                        continue  # ← ここで70Bスキップ
 
             if is_ok:
 
-                print("\n  -> Groq待機中...")
+                print("\n  -> Groq 70B待機中...")
                 
                 syntax_ok, syntax_error = check_python_syntax(modified_code)
 
@@ -961,12 +954,16 @@ def main():
                     # 👇 ここが追加（70B後）
                     test_code = groq_generate_pytest(final_result)
 
-                        for _ in range(2):
-                            if not is_test_weak(test_code):
-                                break
-                            test_code = groq_generate_pytest(...)
-                            (
-                             final_result
+                    
+                    for _ in range(2):
+                        if not is_test_weak(test_code):
+                            break
+                        weakness = explain_test_weakness(test_code)
+
+                        print(f"⚠️ テストが弱い → 再生成\n{weakness}")
+
+                        test_code = groq_generate_pytest(
+                            final_result
                             + "\n\n# 以下の不足を必ず改善してください:\n"
                             + weakness
                             + "\n# 異常系・境界値・正常系を含めてください。"
@@ -1017,27 +1014,17 @@ def main():
                         f"上記の指摘に関係する箇所だけを修正してください。\n"
                         f"無関係なコードは変更しないでください。"
                     )
-            else:
-                print("\n❌ 8BチェックNG → 修正ループへ")
 
-                task_design = (
-                    f"{task_design}\n\n"
-                    f"[8B指摘]\n{check_result}\n\n"
-                    f"上記の指摘に関係する箇所だけを修正してください。\n"
-                    f"無関係なコードは変更しないでください。"
-                )
-
-                continue
 
         else:
             print("❌ 最大試行回数に到達しました。タスク失敗")
 
-    # 最終バックアップ
-    backup_path = file_path + ".backup"
-    write_file(backup_path, original_code)
-
     print(f"\n✅ 完了！ファイルを更新しました: {file_path}")
-    print(f"📁 バックアップ: {backup_path}")
+    # 最終バックアップ
+    if not os.getenv("CI"):
+        backup_path = file_path + ".backup"
+        write_file(backup_path, original_code)
+        print(f"📁 バックアップ: {backup_path}")
 
     final_diff = compute_diff(original_code, current_code, filename)
     print(f"\n## 最終的な変更内容\n{final_diff}")
