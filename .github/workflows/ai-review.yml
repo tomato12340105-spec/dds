@@ -26,7 +26,12 @@ jobs:
         run: pip install requests pytest pytest-cov
 
       - name: run pytest
-        run: pytest --cov=. --cov-report=term --disable-warnings
+        run: |
+          if ls test_*.py *_test.py 1> /dev/null 2>&1; then
+          pytest --cov=. --cov-report=term --disable-warnings
+        else
+          echo "No tests found. Skipping pytest."
+          fi
 
       - name: run AI review
         env:
